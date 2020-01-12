@@ -58,25 +58,60 @@ const getWsTargetFor = (port) => {
   .tapCatch((err) => {
     debug('failed to connect to CDP %o', { connectOpts, err })
   })
-  .then(() => {
-    debug('CRI.List on port %d', port)
-
-    // what happens if the next call throws an error?
-    // it seems to leave the browser instance open
-    return CRI.List(connectOpts)
-  })
-  .then((targets) => {
-    debug('CRI List %o', { numTargets: targets.length, targets })
-    // activate the first available id
-    // find the first target page that's a real tab
-    // and not the dev tools or background page.
-    // since we open a blank page first, it has a special url
+  .then(async () => {
     const newTabTargetFields = {
       type: 'page',
       url: 'about:blank',
     }
 
-    const target = _.find(targets, newTabTargetFields)
+    const getTarget = () => {
+      return CRI.List(connectOpts).then((targets) => {
+        debug('CRI.List on port %d', port)
+        const target = _.find(targets, newTabTargetFields)
+
+        return target
+      })
+    }
+
+    let target = await getTarget()
+
+    if (!target) {
+      debug('waiting for target %o to be created', newTabTargetFields)
+      let timeout
+      const timeoutPromise = new Promise((resolve) => {
+        timeout = setTimeout(() => {
+          debug('timed out waiting for target %o created/changed event, searching all targets', newTabTargetFields)
+          getTarget().then(resolve)
+        }, 15000)
+      })
+
+      const eventHandler = (resolve) => {
+        return ({ targetInfo }) => {
+          if (_.isMatch(targetInfo, newTabTargetFields)) {
+            clearTimeout(timeout)
+            resolve({ ...targetInfo, webSocketDebuggerUrl: `ws://${connectOpts.host}:${port}/devtools/page/${targetInfo.targetId}` })
+          }
+        }
+      }
+
+      debug('connecting to CRI on port %d', port)
+      const client = await CRI(connectOpts)
+
+      debug('enabling setDiscoverTargets')
+      await client.Target.setDiscoverTargets({ discover: true })
+
+      const targetPromise = new Promise((resolve) => {
+        client.on('Target.targetCreated', eventHandler(resolve))
+        client.on('Target.targetInfoChanged', eventHandler(resolve))
+      })
+
+      target = await Promise.race([
+        targetPromise,
+        timeoutPromise,
+      ])
+
+      await client.close()
+    }
 
     la(target, 'could not find CRI target')
 
